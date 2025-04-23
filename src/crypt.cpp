@@ -225,7 +225,6 @@ BOOL SyskeyGetClassBytes(HKEY hKeyReg,LPSTR keyName,LPSTR valueName,LPBYTE class
 int CRYPT_SyskeyGetOfflineValue(s_SYSKEY *pSyskey, LPTSTR hiveFileName) {
 	LONG WINAPI errorCode;
 	DWORD dwSecureBoot = 0;
-	HKEY hkey;
 	BYTE syskey[16];
 	BYTE syskeyPerm[16] = { 0x8, 0x5, 0x4, 0x2, 0xb, 0x9, 0xd, 0x3, 0x0, 0x6, 0x1, 0xc, 0xe, 0xa, 0xf, 0x7 };
 	int i;
@@ -308,24 +307,38 @@ int CRYPT_SyskeyGetValue(s_SYSKEY *pSyskey) {
  *   SYSKEY_METHOD_NOT_IMPL => if syskey is not stored locally 
  */
 int CRYPT_BootkeyGetValue(s_BOOTKEY_ciphered *bootkey_ciphered,s_BOOTKEY *bootkey) {
-	BYTE rc4_key[MD5_DIGEST_LENGTH];
-	MD5_CTX md5_ctx;
-	RC4_KEY rc4_ctx;
-	s_SYSKEY syskey;
 	int retCode;
+	s_SYSKEY syskey;
 
-	if((retCode = CRYPT_SyskeyGetValue(&syskey))!=SYSKEY_SUCCESS)
+	if ((retCode = CRYPT_SyskeyGetValue(&syskey)) != SYSKEY_SUCCESS)
 		return retCode;
 
-	MD5_Init(&md5_ctx);
-	MD5_Update(&md5_ctx,bootkey_ciphered->F+0x70,16);
-	MD5_Update(&md5_ctx,SAM_QWERTY,lstrlen(SAM_QWERTY)+1);
-	MD5_Update(&md5_ctx,syskey.key,sizeof(syskey.key));
-	MD5_Update(&md5_ctx,SAM_NUM,lstrlen(SAM_NUM)+1);
-	MD5_Final(rc4_key,&md5_ctx);
+	switch (bootkey_ciphered->F[0]) {
+	case 2: {
+		MD5_CTX md5_ctx;
+		RC4_KEY rc4_ctx;
+		BYTE rc4_key[MD5_DIGEST_LENGTH];
 
-	RC4_set_key(&rc4_ctx,MD5_DIGEST_LENGTH,rc4_key);
-	RC4(&rc4_ctx,sizeof(bootkey->key),bootkey_ciphered->F+0x80,bootkey->key);
+		MD5_Init(&md5_ctx);
+		MD5_Update(&md5_ctx, bootkey_ciphered->F + 0x70, 16);
+		MD5_Update(&md5_ctx, SAM_QWERTY, lstrlen(SAM_QWERTY) + 1);
+		MD5_Update(&md5_ctx, syskey.key, sizeof(syskey.key));
+		MD5_Update(&md5_ctx, SAM_NUM, lstrlen(SAM_NUM) + 1);
+		MD5_Final(rc4_key, &md5_ctx);
+
+		RC4_set_key(&rc4_ctx, MD5_DIGEST_LENGTH, rc4_key);
+		RC4(&rc4_ctx, sizeof(bootkey->key), bootkey_ciphered->F + 0x80, bootkey->key);
+		break;
+	}
+	case 3: {
+		AES_KEY aes_ctx;
+		AES_set_decrypt_key(syskey.key, sizeof(syskey.key) * 8, &aes_ctx);
+		AES_cbc_encrypt(bootkey_ciphered->F + 0x88, bootkey->key, sizeof(bootkey->key), &aes_ctx, bootkey_ciphered->F + 0x78, AES_DECRYPT);
+		break;
+	}
+	default:
+		return SYSKEY_METHOD_NOT_IMPL;
+	}
 
 	return SYSKEY_SUCCESS;
 }
@@ -566,72 +579,115 @@ void CRYPT_SAM_Decipher(LPBYTE ntlm_hash,int nb_hash,DWORD rid,s_BOOTKEY *bootke
 	}
 }
 
+/*
+ * Decipher one local account hash (LM or NT)
+ */
+void CRYPT_SAM_Salted_Decipher(LPBYTE ntlm_hash, int nb_hash, DWORD rid, s_BOOTKEY *bootkey, const unsigned char *szPasswordCste, LPBYTE deciphered)
+{
+	DES_key_schedule des_key1, des_key2;
+	BYTE key1[8], key2[8];
+	BYTE iv[MD5_DIGEST_LENGTH];
+	BYTE tmp[24 * WIN_NTLM2_HASH_SIZE]; /* No more than 24 entries in hashes history */
+	int i;
+
+	/* Decrypt hash use AES */
+	AES_KEY aes_ctx;
+	AES_set_decrypt_key(bootkey->key, sizeof(bootkey->key) * 8, &aes_ctx);
+	RtlMoveMemory(iv, szPasswordCste, sizeof(iv));
+	AES_cbc_encrypt(ntlm_hash, tmp, nb_hash * WIN_NTLM2_HASH_SIZE, &aes_ctx, iv, AES_DECRYPT);
+
+	/* Build DES keys from account RID */
+	RIDToDESKey(rid, key1, key2);
+
+	/* DES deciphering */
+	DES_set_odd_parity((const_DES_cblock *)key1);
+	DES_set_odd_parity((const_DES_cblock *)key2);
+	DES_set_key((const_DES_cblock *)key1, &des_key1);
+	DES_set_key((const_DES_cblock *)key2, &des_key2);
+
+	for (i = 0; i < nb_hash; i++) {
+		DES_ecb_encrypt((const_DES_cblock *)(tmp + i * WIN_NTLM_HASH_SIZE), (const_DES_cblock *)(deciphered + i * WIN_NTLM_HASH_SIZE), &des_key1, DES_DECRYPT);
+		DES_ecb_encrypt((const_DES_cblock *)(tmp + 8 + i * WIN_NTLM_HASH_SIZE), (const_DES_cblock *)(deciphered + 8 + i * WIN_NTLM_HASH_SIZE), &des_key2, DES_DECRYPT);
+	}
+}
 
 /*
  * Decipher one local account hash + full history if asked
  */
 BOOL CRYPT_SAM_DecipherLocalAccount(s_localAccountInfo *localAccountEntry,s_BOOTKEY *bootkey) {
-	BYTE lm_hash[WIN_NTLM_HASH_SIZE*24],nt_hash[WIN_NTLM_HASH_SIZE*24];
-	BYTE deciphered_lm_hash[WIN_NTLM_HASH_SIZE*24],deciphered_nt_hash[WIN_NTLM_HASH_SIZE*24];	/* No more than 24 entries in hashes history */
-	size_t hash_offset = *(LPWORD)(localAccountEntry->V+0x9c) + 0xCC + 4;
-	size_t hash_history_offset;
+	size_t hash_offset = *(LPWORD)(localAccountEntry->V+0x9c) + 0xCC;
 	UINT i;
 
-	RtlZeroMemory(lm_hash,sizeof(lm_hash));
-	RtlZeroMemory(nt_hash,sizeof(nt_hash));
-
-	/* Get current hash */
-	if(((*((LPDWORD)(localAccountEntry->V + hash_offset))) & 0xFFFFFF00) != 0x10000) { /* Is LM hash ? */
-		RtlMoveMemory(lm_hash,localAccountEntry->V + hash_offset,WIN_NTLM_HASH_SIZE);
-		localAccountEntry->NTLM_hash.hash_type = LM_HASH;
-		hash_offset += WIN_NTLM_HASH_SIZE + 4;
-	}
-	else {
-		localAccountEntry->NTLM_hash.hash_type = NT_HASH;
-		hash_offset += 4;
-	}
-
-	if(((*((LPDWORD)(localAccountEntry->V + hash_offset))) & 0xFFFFFF00) != 0x10000) { /* Is it NT or not password protected? */
-		RtlMoveMemory(nt_hash,localAccountEntry->V + hash_offset,WIN_NTLM_HASH_SIZE);
-		hash_offset += WIN_NTLM_HASH_SIZE + 4;
-	}
-	else {
-		localAccountEntry->NTLM_hash.hash_type = NT_NO_HASH;
-		hash_offset += 4;
+	if (localAccountEntry->V[hash_offset + 2] == 1) {
+		if (*(LPWORD)(localAccountEntry->V + 0x9c + 4) == 20) {
+			localAccountEntry->NTLM_hash.hash_type = LM_HASH;
+			CRYPT_SAM_Decipher(localAccountEntry->V + hash_offset + 4, 1, localAccountEntry->rid, bootkey, SAM_LMPASS, localAccountEntry->NTLM_hash.LM_hash);
+		} else {
+			localAccountEntry->NTLM_hash.hash_type = NT_HASH;
+		}
+	} else if (localAccountEntry->V[hash_offset + 2] == 2) {
+		if (*(LPWORD)(localAccountEntry->V + 0x9c + 4) == 56) {
+			localAccountEntry->NTLM_hash.hash_type = LM_HASH;
+			CRYPT_SAM_Salted_Decipher(localAccountEntry->V + hash_offset + 20, 1, localAccountEntry->rid, bootkey, localAccountEntry->V + hash_offset + 4, localAccountEntry->NTLM_hash.LM_hash);
+		} else {
+			localAccountEntry->NTLM_hash.hash_type = NT_HASH;
+		}
 	}
 
-	/* Decipher current hash */
-	if(localAccountEntry->NTLM_hash.hash_type==LM_HASH)
-		CRYPT_SAM_Decipher(lm_hash,1,localAccountEntry->rid,bootkey,SAM_LMPASS,localAccountEntry->NTLM_hash.LM_hash);
-	if(localAccountEntry->NTLM_hash.hash_type!=NT_NO_HASH)
-		CRYPT_SAM_Decipher(nt_hash,1,localAccountEntry->rid,bootkey,SAM_NTPASS,localAccountEntry->NTLM_hash.NT_hash);
+	hash_offset = *(LPWORD)(localAccountEntry->V + 0xa8) + 0xCC;
+	if (localAccountEntry->V[hash_offset + 2] == 1) {
+		if (*(LPWORD)(localAccountEntry->V + 0xa8 + 4) == 20) {
+			CRYPT_SAM_Decipher(localAccountEntry->V + hash_offset + 4, 1, localAccountEntry->rid, bootkey, SAM_NTPASS, localAccountEntry->NTLM_hash.NT_hash);
+		} else {
+			localAccountEntry->NTLM_hash.hash_type = NT_NO_HASH;
+		}
+	} else if (localAccountEntry->V[hash_offset + 2] == 2) {
+		if (*(LPWORD)(localAccountEntry->V + 0xa8 + 4) == 56) {
+			CRYPT_SAM_Salted_Decipher(localAccountEntry->V + hash_offset + 24, 1, localAccountEntry->rid, bootkey, localAccountEntry->V + hash_offset + 8, localAccountEntry->NTLM_hash.NT_hash);
+		} else {
+			localAccountEntry->NTLM_hash.hash_type = NT_NO_HASH;
+		}
+	}
 
 
 	/* Decipher history if there is */
 	if(localAccountEntry->NTLM_hash_history) {
-		hash_history_offset = hash_offset;
-
-		/* Fix localAccountEntry->nbHistoryEntries - 
-			(Strange MS behavior) for mixed LM / NTLM in history */
-		while(((*((LPDWORD)(localAccountEntry->V + hash_offset))) & 0xFFFFFF00) != 0x10000) 
+		hash_offset = *(LPWORD)(localAccountEntry->V + 0xb4) + 0xCC;
+		if (localAccountEntry->V[hash_offset + 2] == 1) {
+			localAccountEntry->nbHistoryEntries = (*(LPWORD)(localAccountEntry->V + 0xb4 + 4) - 4) / 16;
 			hash_offset += 4;
-		localAccountEntry->nbHistoryEntries = (hash_offset - hash_history_offset) /  WIN_NTLM_HASH_SIZE;
-
-		RtlMoveMemory(nt_hash,localAccountEntry->V + hash_history_offset,localAccountEntry->nbHistoryEntries*WIN_NTLM_HASH_SIZE);
-		CRYPT_SAM_Decipher(nt_hash,localAccountEntry->nbHistoryEntries,localAccountEntry->rid,bootkey,SAM_NTPASS_HISTORY,deciphered_nt_hash);
-		
-		if((hash_history_offset+4+(localAccountEntry->nbHistoryEntries * WIN_NTLM_HASH_SIZE * 2))<=localAccountEntry->dwVSize) {
-			RtlMoveMemory(lm_hash,localAccountEntry->V + hash_history_offset + (localAccountEntry->nbHistoryEntries*WIN_NTLM_HASH_SIZE) + 4,localAccountEntry->nbHistoryEntries*WIN_NTLM_HASH_SIZE);
-			CRYPT_SAM_Decipher(lm_hash,localAccountEntry->nbHistoryEntries,localAccountEntry->rid,bootkey,SAM_LMPASS_HISTORY,deciphered_lm_hash);
+			BYTE deciphered_nt_hash[WIN_NTLM_HASH_SIZE * 24];
+			CRYPT_SAM_Decipher(localAccountEntry->V + hash_offset, localAccountEntry->nbHistoryEntries, localAccountEntry->rid, bootkey, SAM_NTPASS_HISTORY, deciphered_nt_hash);
+			for (i = 0; i < localAccountEntry->nbHistoryEntries; i++, hash_offset += 16) {
+					RtlMoveMemory(localAccountEntry->NTLM_hash_history[i].NT_hash,deciphered_nt_hash+i*WIN_NTLM_HASH_SIZE,WIN_NTLM_HASH_SIZE);
+			}
+		} else if (localAccountEntry->V[hash_offset + 2] == 2) {
+			localAccountEntry->nbHistoryEntries = (*(LPWORD)(localAccountEntry->V + 0xb4 + 4) - 8) / 48;
+			hash_offset += 8;
+			BYTE deciphered_nt_hash[WIN_NTLM_HASH_SIZE * 24];
+			CRYPT_SAM_Decipher(localAccountEntry->V + hash_offset, localAccountEntry->nbHistoryEntries, localAccountEntry->rid, bootkey, SAM_NTPASS_HISTORY, deciphered_nt_hash);
+			for (i = 0; i < localAccountEntry->nbHistoryEntries; i++, hash_offset += 48) {
+				RtlMoveMemory(localAccountEntry->NTLM_hash_history[i].NT_hash, deciphered_nt_hash + i * WIN_NTLM_HASH_SIZE, WIN_NTLM_HASH_SIZE);
+			}
 		}
-		else {
-			for(i=0;i<localAccountEntry->nbHistoryEntries;i++)
-				RtlMoveMemory(deciphered_lm_hash+i*WIN_NTLM_HASH_SIZE,SAM_EMPTY_LM_BYTES,WIN_NTLM_HASH_SIZE);
-		}
 
-		for(i=0;i<localAccountEntry->nbHistoryEntries;i++) {
-			RtlMoveMemory(localAccountEntry->NTLM_hash_history[i].NT_hash,deciphered_nt_hash+i*WIN_NTLM_HASH_SIZE,WIN_NTLM_HASH_SIZE);
-			RtlMoveMemory(localAccountEntry->NTLM_hash_history[i].LM_hash,deciphered_lm_hash+i*WIN_NTLM_HASH_SIZE,WIN_NTLM_HASH_SIZE);
+		hash_offset = *(LPWORD)(localAccountEntry->V + 0xc0) + 0xCC;
+		if (localAccountEntry->V[hash_offset + 2] == 1) {
+			localAccountEntry->nbHistoryEntries = (*(LPWORD)(localAccountEntry->V + 0xc0 + 4) - 4) / 16;
+			hash_offset += 4;
+			BYTE deciphered_lm_hash[WIN_NTLM_HASH_SIZE * 24];
+			CRYPT_SAM_Decipher(localAccountEntry->V + hash_offset, localAccountEntry->nbHistoryEntries, localAccountEntry->rid, bootkey, SAM_LMPASS_HISTORY, deciphered_lm_hash);
+			for (i = 0; i < localAccountEntry->nbHistoryEntries; i++, hash_offset += 16) {
+				RtlMoveMemory(localAccountEntry->NTLM_hash_history[i].LM_hash, deciphered_lm_hash + i * WIN_NTLM_HASH_SIZE, WIN_NTLM_HASH_SIZE);
+			}
+		} else if (localAccountEntry->V[hash_offset + 2] == 2) {
+			localAccountEntry->nbHistoryEntries = (*(LPWORD)(localAccountEntry->V + 0xc0 + 4) - 8) / 48;
+			hash_offset += 8;
+			BYTE deciphered_lm_hash[WIN_NTLM_HASH_SIZE * 24];
+			CRYPT_SAM_Decipher(localAccountEntry->V + hash_offset, localAccountEntry->nbHistoryEntries, localAccountEntry->rid, bootkey, SAM_LMPASS_HISTORY, deciphered_lm_hash);
+			for (i = 0; i < localAccountEntry->nbHistoryEntries; i++, hash_offset += 48) {
+				RtlMoveMemory(localAccountEntry->NTLM_hash_history[i].LM_hash, deciphered_lm_hash + i * WIN_NTLM_HASH_SIZE, WIN_NTLM_HASH_SIZE);
+			}
 		}
 	}
 

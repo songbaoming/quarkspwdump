@@ -53,13 +53,13 @@ int LoadHive(LPTSTR lpszHiveName)
 		// In order to use this program for Win95/98/ME as well as for WinNT/2000/XP
 		// we have to load unsupported under Win95/98/ME export dynamically.
 
-		BOOL(__stdcall *NT_OpenProcessToken)(HANDLE ProcessHandle,
+		typedef	BOOL(__stdcall* fn_OpenProcessToken)(HANDLE ProcessHandle,
 			DWORD DesiredAccess, PHANDLE TokenHandle);
 
-		BOOL(__stdcall *NT_LookupPrivilegeValue)(LPCTSTR lpSystemName,
+		typedef	BOOL(__stdcall* fn_LookupPrivilegeValue)(LPCTSTR lpSystemName,
 			LPCTSTR lpName, PLUID lpLuid);
 
-		BOOL(__stdcall *NT_AdjustTokenPrivileges)(HANDLE TokenHandle,
+		typedef	BOOL(__stdcall* fn_AdjustTokenPrivileges)(HANDLE TokenHandle,
 			BOOL DisableAllPrivileges, PTOKEN_PRIVILEGES NewState,
 			DWORD BufferLength, PTOKEN_PRIVILEGES PreviousState,
 			PDWORD ReturnLength);
@@ -68,19 +68,11 @@ int LoadHive(LPTSTR lpszHiveName)
 		if (hAdvApi == NULL)
 			return GetLastError();
 
-		NT_OpenProcessToken = (BOOL(__stdcall *)(HANDLE ProcessHandle,
-			DWORD DesiredAccess, PHANDLE TokenHandle))
-			GetProcAddress(hAdvApi, "OpenProcessToken");
+		auto NT_OpenProcessToken = (fn_OpenProcessToken)GetProcAddress(hAdvApi, "OpenProcessToken");
 
-		NT_LookupPrivilegeValue = (BOOL(__stdcall *)(LPCTSTR lpSystemName,
-			LPCTSTR lpName, PLUID lpLuid))
-			GetProcAddress(hAdvApi, "LookupPrivilegeValue"MODIFY_NAME);
+		auto NT_LookupPrivilegeValue = (fn_LookupPrivilegeValue)GetProcAddress(hAdvApi, "LookupPrivilegeValue" MODIFY_NAME);
 
-		NT_AdjustTokenPrivileges = (BOOL(__stdcall *)(HANDLE TokenHandle,
-			BOOL DisableAllPrivileges, PTOKEN_PRIVILEGES NewState,
-			DWORD BufferLength, PTOKEN_PRIVILEGES PreviousState,
-			PDWORD ReturnLength))
-			GetProcAddress(hAdvApi, "AdjustTokenPrivileges");
+		auto NT_AdjustTokenPrivileges = (fn_AdjustTokenPrivileges)GetProcAddress(hAdvApi, "AdjustTokenPrivileges");
 
 
 		if (!NT_AdjustTokenPrivileges || !NT_LookupPrivilegeValue || !NT_OpenProcessToken)

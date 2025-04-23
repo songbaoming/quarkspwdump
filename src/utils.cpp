@@ -113,10 +113,7 @@ BOOL RegGetValueEx(HKEY hKeyReg,LPSTR keyName,LPSTR valueName,LPDWORD type,LPVOI
 			*outValSize = dwValueSize;
 		RegCloseKey(hKey);
 
-		if(!valSize)
-			return (ret==ERROR_SUCCESS);
-
-		return (ret==ERROR_SUCCESS) && (dwValueSize==valSize);
+		return (ret==ERROR_SUCCESS);
 	}
 
 	return FALSE;

@@ -47,7 +47,7 @@
 	}s_BOOTKEY;
 
 	typedef struct{
-		BYTE F[240];
+		BYTE F[1024];
 	}s_BOOTKEY_ciphered;
 
 	typedef struct{

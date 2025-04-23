@@ -1,0 +1,11 @@
+**/.vs
+**/Debug
+**/Release
+**/*.bat
+**/*.suo
+**/*.aps
+*.user
+*.sdf
+*.ipch
+*.VC.db
+.vscode

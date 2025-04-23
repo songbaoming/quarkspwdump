@@ -12,6 +12,7 @@ static BYTE SAM_EMPTY_LM_BYTES[16] = {0xAA,0xD3,0xB4,0x35,0xB5,0x14,0x04,0xEE,0x
 
 /* NT/LM hash struct */
 #define WIN_NTLM_HASH_SIZE 16
+#define WIN_NTLM2_HASH_SIZE 32
 typedef enum{LM_HASH,NT_HASH,NT_NO_HASH}NT_HASH_TYPE;
 
 typedef struct {

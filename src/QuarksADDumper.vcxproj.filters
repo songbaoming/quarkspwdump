@@ -64,9 +64,6 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <Library Include="lib\libeay32MT.lib" />
-  </ItemGroup>
-  <ItemGroup>
     <ResourceCompile Include="QuarksPwDump.rc">
       <Filter>Resource Files</Filter>
     </ResourceCompile>
